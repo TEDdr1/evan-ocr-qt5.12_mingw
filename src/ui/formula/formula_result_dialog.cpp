@@ -1,0 +1,403 @@
+#include "formula_result_dialog.h"
+#include "../../core/formula/formula_format_helper.h"
+#include "../../core/theme_manager.h"
+#include "../plugin/plugin_market_dialog.h"
+#include "../wheel_guard.h"
+#include <QApplication>
+#include <QClipboard>
+#include <QTimer>
+#include <QPainter>
+#include <QMessageBox>
+#include <QInputDialog>
+#include <QPointer>
+#include <QListView>
+#include <QDebug>
+
+FormulaResultDialog::FormulaResultDialog(QWidget* parent)
+    : QDialog(parent)
+{
+    setWindowFlags(Qt::Window | Qt::WindowCloseButtonHint | Qt::WindowTitleHint | Qt::WindowMinMaxButtonsHint);
+    setWindowTitle("数学公式识别与转换 - Evan");
+    resize(940, 620);
+    setMinimumSize(780, 500);
+
+    // 同步 Windows 原生标题栏深色样式
+    ThemeManager::installDarkTitleBar(this);
+
+    setupUi();
+}
+
+void FormulaResultDialog::setupUi()
+{
+    auto* mainLayout = new QVBoxLayout(this);
+    mainLayout->setContentsMargins(18, 16, 18, 16);
+    mainLayout->setSpacing(12);
+
+    // ==========================================
+    // 顶部控制栏 (Header Bar)
+    // ==========================================
+    auto* topHeaderLayout = new QHBoxLayout();
+    topHeaderLayout->setSpacing(10);
+
+    m_titleLabel = new QLabel("∑ 公式识别与转换", this);
+    topHeaderLayout->addWidget(m_titleLabel);
+
+    m_badgeLabel = new QLabel("LaTeX / MathML / Word", this);
+    topHeaderLayout->addWidget(m_badgeLabel);
+
+    topHeaderLayout->addStretch();
+
+    m_modeLabel = new QLabel("识别通道:", this);
+    topHeaderLayout->addWidget(m_modeLabel);
+
+    m_engineCombo = new QComboBox(this);
+    m_engineCombo->setView(new QListView(m_engineCombo));
+    installWheelGuard(m_engineCombo);
+    m_engineCombo->setFixedWidth(200);
+    refreshEngineComboState();
+
+    connect(m_engineCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        QString selectedMode = m_engineCombo->currentData().toString();
+        if (selectedMode == "Offline_missing") {
+            auto reply = QMessageBox::information(
+                this, "提示",
+                "RapidLaTeXOCR 离线公式识别引擎尚未安装。\n是否打开插件中心一键安装？",
+                QMessageBox::Ok | QMessageBox::Cancel
+            );
+            if (reply == QMessageBox::Ok) {
+                static PluginMarketDialog* dlg = nullptr;
+                if (!dlg) dlg = new PluginMarketDialog();
+                dlg->show();
+                dlg->raise();
+                dlg->activateWindow();
+            }
+            int onlineIdx = m_engineCombo->findData("Online");
+            if (onlineIdx >= 0) m_engineCombo->setCurrentIndex(onlineIdx);
+            return;
+        }
+
+        FormulaOcrManager::instance().setPreferredMode(selectedMode);
+        if (!m_sourceImage.isNull()) {
+            startRecognition(m_sourceImage, m_dpr);
+        }
+    });
+    topHeaderLayout->addWidget(m_engineCombo);
+
+    m_tokenBtn = new QPushButton("⚙️ 配置 Token", this);
+    m_tokenBtn->setCursor(Qt::PointingHandCursor);
+    m_tokenBtn->setToolTip("配置 SimpleTeX 授权 Token (可在 simpletex.cn 免费申请，每月赠送上千次调用)");
+    connect(m_tokenBtn, &QPushButton::clicked, this, &FormulaResultDialog::onTokenConfigClicked);
+    topHeaderLayout->addWidget(m_tokenBtn);
+
+    mainLayout->addLayout(topHeaderLayout);
+
+    // ==========================================
+    // 核心垂直分割器 (Top Comparison / Bottom Code)
+    // ==========================================
+    auto* vSplitter = new QSplitter(Qt::Vertical, this);
+    vSplitter->setChildrenCollapsible(false);
+
+    // 上半部分水平对比 Splitter
+    auto* hSplitter = new QSplitter(Qt::Horizontal, vSplitter);
+    hSplitter->setChildrenCollapsible(false);
+
+    // 左侧卡片：原图
+    auto* leftBox = new QWidget(hSplitter);
+    auto* leftLayout = new QVBoxLayout(leftBox);
+    leftLayout->setContentsMargins(0, 0, 5, 0);
+    leftLayout->setSpacing(6);
+
+    auto* origHeader = new QHBoxLayout();
+    m_origTitle = new QLabel("选区原图", leftBox);
+    origHeader->addWidget(m_origTitle);
+    origHeader->addStretch();
+    leftLayout->addLayout(origHeader);
+
+    m_originalScrollArea = new QScrollArea(leftBox);
+    m_originalScrollArea->setWidgetResizable(true);
+    m_originalScrollArea->setAlignment(Qt::AlignCenter);
+    m_originalImgLabel = new QLabel(m_originalScrollArea);
+    m_originalImgLabel->setAlignment(Qt::AlignCenter);
+    m_originalScrollArea->setWidget(m_originalImgLabel);
+    leftLayout->addWidget(m_originalScrollArea, 1);
+
+    hSplitter->addWidget(leftBox);
+
+    // 右侧卡片：实时渲染公式预览 (超高清防模糊)
+    auto* rightBox = new QWidget(hSplitter);
+    auto* rightLayout = new QVBoxLayout(rightBox);
+    rightLayout->setContentsMargins(5, 0, 0, 0);
+    rightLayout->setSpacing(6);
+
+    auto* prevHeader = new QHBoxLayout();
+    m_previewTitle = new QLabel("公式矢量渲染预览", rightBox);
+    prevHeader->addWidget(m_previewTitle);
+    prevHeader->addStretch();
+    rightLayout->addLayout(prevHeader);
+
+    m_renderedScrollArea = new QScrollArea(rightBox);
+    m_renderedScrollArea->setWidgetResizable(true);
+    m_renderedScrollArea->setAlignment(Qt::AlignCenter);
+    m_renderedFormulaLabel = new QLabel("等待公式识别结果...", m_renderedScrollArea);
+    m_renderedFormulaLabel->setAlignment(Qt::AlignCenter);
+    m_renderedScrollArea->setWidget(m_renderedFormulaLabel);
+    rightLayout->addWidget(m_renderedScrollArea, 1);
+
+    hSplitter->addWidget(rightBox);
+    hSplitter->setSizes({450, 450});
+
+    vSplitter->addWidget(hSplitter);
+
+    // 下半部卡片：LaTeX 源码与微调编辑
+    auto* codeBox = new QWidget(vSplitter);
+    auto* codeLayout = new QVBoxLayout(codeBox);
+    codeLayout->setContentsMargins(0, 6, 0, 0);
+    codeLayout->setSpacing(6);
+
+    auto* codeHeaderLayout = new QHBoxLayout();
+    m_codeTitle = new QLabel("LaTeX 源码 (可直接修改编辑):", codeBox);
+    codeHeaderLayout->addWidget(m_codeTitle);
+    codeHeaderLayout->addStretch();
+    codeLayout->addLayout(codeHeaderLayout);
+
+    m_latexEdit = new QPlainTextEdit(codeBox);
+    m_latexEdit->setPlaceholderText("公式识别完成后，LaTeX 代码将在此呈现并支持编辑修改...");
+    codeLayout->addWidget(m_latexEdit, 1);
+
+    vSplitter->addWidget(codeBox);
+    vSplitter->setSizes({240, 280});
+
+    mainLayout->addWidget(vSplitter, 1);
+
+    // ==========================================
+    // 底部工具与动作栏 (Footer Action Bar)
+    // ==========================================
+    auto* bottomLayout = new QHBoxLayout();
+    bottomLayout->setSpacing(10);
+
+    m_statusLabel = new QLabel("就绪", this);
+    m_statusLabel->setStyleSheet("color: #64748b; font-size: 12px; font-weight: 500;");
+    bottomLayout->addWidget(m_statusLabel);
+
+    bottomLayout->addStretch();
+
+    // 1. 复制 LaTeX
+    m_copyLatexBtn = new QPushButton("复制 LaTeX", this);
+    m_copyLatexBtn->setCursor(Qt::PointingHandCursor);
+    m_copyLatexBtn->setToolTip("复制纯净 LaTeX 公式代码");
+    connect(m_copyLatexBtn, &QPushButton::clicked, this, [this]() {
+        QString text = m_latexEdit->toPlainText().trimmed();
+        if (text.isEmpty()) return;
+        QApplication::clipboard()->setText(text);
+        m_copyLatexBtn->setText("✓ 已复制");
+        QTimer::singleShot(1500, this, [this]() {
+            if (m_copyLatexBtn) m_copyLatexBtn->setText("复制 LaTeX");
+        });
+    });
+    bottomLayout->addWidget(m_copyLatexBtn);
+
+    // 2. 复制 Markdown
+    m_copyMarkdownBtn = new QPushButton("复制 Markdown", this);
+    m_copyMarkdownBtn->setCursor(Qt::PointingHandCursor);
+    m_copyMarkdownBtn->setToolTip("复制为 $$ ... $$ 块级 Markdown 公式语法");
+    connect(m_copyMarkdownBtn, &QPushButton::clicked, this, [this]() {
+        QString text = m_latexEdit->toPlainText().trimmed();
+        if (text.isEmpty()) return;
+        QString md = FormulaFormatHelper::toBlockMarkdown(text);
+        QApplication::clipboard()->setText(md);
+        m_copyMarkdownBtn->setText("✓ 已复制");
+        QTimer::singleShot(1500, this, [this]() {
+            if (m_copyMarkdownBtn) m_copyMarkdownBtn->setText("复制 Markdown");
+        });
+    });
+    bottomLayout->addWidget(m_copyMarkdownBtn);
+
+    // 3. 复制 MathML (Word 直粘，视觉主按钮)
+    m_copyWordBtn = new QPushButton("复制 Word (MathML)", this);
+    m_copyWordBtn->setObjectName("wordBtn");
+    m_copyWordBtn->setCursor(Qt::PointingHandCursor);
+    m_copyWordBtn->setToolTip("复制为标准 MathML XML，切换至 Microsoft Word 后直接 Ctrl+V 即刻转为原生 Word 数学公式");
+    connect(m_copyWordBtn, &QPushButton::clicked, this, [this]() {
+        QString text = m_latexEdit->toPlainText().trimmed();
+        if (text.isEmpty()) return;
+        QString mathml = FormulaFormatHelper::toWordMathML(text);
+        QApplication::clipboard()->setText(mathml);
+        m_copyWordBtn->setText("✓ 已复制");
+        QTimer::singleShot(1500, this, [this]() {
+            if (m_copyWordBtn) m_copyWordBtn->setText("复制 Word (MathML)");
+        });
+    });
+    bottomLayout->addWidget(m_copyWordBtn);
+
+    m_closeBtn = new QPushButton("关闭", this);
+    m_closeBtn->setCursor(Qt::PointingHandCursor);
+    connect(m_closeBtn, &QPushButton::clicked, this, &QDialog::accept);
+    bottomLayout->addWidget(m_closeBtn);
+
+    mainLayout->addLayout(bottomLayout);
+
+    applyTheme();
+    connect(&ThemeManager::instance(), &ThemeManager::themeChanged, this, [this](bool) {
+        applyTheme();
+    });
+}
+
+void FormulaResultDialog::applyTheme()
+{
+    setStyleSheet(ThemeManager::instance().getFormulaDialogStyle());
+    bool dark = ThemeManager::instance().isDarkMode();
+
+    if (m_titleLabel) {
+        m_titleLabel->setStyleSheet(dark ? "font-size: 16px; font-weight: bold; color: #f4f4f5;" : "font-size: 16px; font-weight: bold; color: #0f172a;");
+    }
+    if (m_badgeLabel) {
+        m_badgeLabel->setStyleSheet(dark
+            ? "background-color: #1e3a8a; color: #93c5fd; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 4px; border: 1px solid #3b82f6;"
+            : "background-color: #eff6ff; color: #2563eb; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 4px; border: 1px solid #bfdbfe;");
+    }
+    if (m_modeLabel) {
+        m_modeLabel->setStyleSheet(dark ? "color: #a1a1aa; font-size: 12px; font-weight: 500;" : "color: #64748b; font-size: 12px; font-weight: 500;");
+    }
+    if (m_origTitle) {
+        m_origTitle->setStyleSheet(dark ? "font-size: 12px; color: #a1a1aa; font-weight: 600;" : "font-size: 12px; color: #475569; font-weight: 600;");
+    }
+    if (m_previewTitle) {
+        m_previewTitle->setStyleSheet(dark ? "font-size: 12px; color: #a1a1aa; font-weight: 600;" : "font-size: 12px; color: #475569; font-weight: 600;");
+    }
+    if (m_codeTitle) {
+        m_codeTitle->setStyleSheet(dark ? "font-size: 12px; color: #a1a1aa; font-weight: 600;" : "font-size: 12px; color: #475569; font-weight: 600;");
+    }
+    if (m_statusLabel) {
+        m_statusLabel->setStyleSheet(dark ? "color: #a1a1aa; font-size: 12px; font-weight: 500;" : "color: #64748b; font-size: 12px; font-weight: 500;");
+    }
+    if (m_renderedFormulaLabel && (!m_renderedFormulaLabel->pixmap() || m_renderedFormulaLabel->pixmap()->isNull())) {
+        m_renderedFormulaLabel->setStyleSheet(dark ? "color: #a1a1aa; font-size: 13px; font-weight: 500;" : "color: #94a3b8; font-size: 13px; font-weight: 500;");
+    }
+    if (m_originalScrollArea && m_originalScrollArea->viewport()) {
+        m_originalScrollArea->viewport()->setStyleSheet("background: transparent;");
+    }
+    if (m_renderedScrollArea && m_renderedScrollArea->viewport()) {
+        m_renderedScrollArea->viewport()->setStyleSheet("background: transparent;");
+    }
+}
+
+void FormulaResultDialog::onTokenConfigClicked()
+{
+    QString currentToken = FormulaOcrManager::instance().simpleTexToken();
+    bool ok = false;
+    QString text = QInputDialog::getText(
+        this,
+        "SimpleTeX Token 配置",
+        "请输入 SimpleTeX 授权 Token (免费申请地址: https://simpletex.cn):\n填入后即可永久解锁每月上千次免费高精度在线公式识别：",
+        QLineEdit::Normal,
+        currentToken,
+        &ok
+    );
+    if (ok) {
+        FormulaOcrManager::instance().setSimpleTexToken(text.trimmed());
+        QMessageBox::information(this, "提示", "SimpleTeX Token 配置已成功保存！");
+        if (!m_sourceImage.isNull()) {
+            startRecognition(m_sourceImage, m_dpr);
+        }
+    }
+}
+
+void FormulaResultDialog::refreshEngineComboState()
+{
+    if (!m_engineCombo) return;
+    QSignalBlocker blocker(m_engineCombo);
+    m_engineCombo->clear();
+
+    m_engineCombo->addItem("在线云端通道 (高速·免模型)", "Online");
+
+    bool offlineReady = FormulaOcrManager::instance().isOfflinePluginReady();
+    if (offlineReady) {
+        m_engineCombo->addItem("本地离线插件 (RapidLaTeX)", "Offline");
+    } else {
+        m_engineCombo->addItem("本地离线插件 (未安装)", "Offline_missing");
+    }
+
+    QString pref = FormulaOcrManager::instance().preferredMode();
+    int idx = m_engineCombo->findData(pref);
+    if (idx >= 0) {
+        m_engineCombo->setCurrentIndex(idx);
+    } else {
+        m_engineCombo->setCurrentIndex(0);
+    }
+}
+
+void FormulaResultDialog::startRecognition(const QPixmap& pixmap, qreal dpr)
+{
+    m_sourceImage = pixmap;
+    m_dpr = dpr;
+
+    // 显示原图
+    if (m_originalImgLabel) {
+        m_originalImgLabel->setPixmap(pixmap);
+    }
+
+    // 重置状态
+    m_latexEdit->setPlainText("正在识别数学公式中，请稍候...");
+    m_renderedFormulaLabel->setText("公式正在生成中...");
+    m_statusLabel->setText("正在连接通道并提取公式结构...");
+
+    // 使用 QPointer 安全守卫：彻底防止用户中途关闭窗口时异步回调触发崩溃卡退
+    QPointer<FormulaResultDialog> guard(this);
+
+    FormulaOcrManager::instance().recognizeAsync(pixmap.toImage(), dpr, [guard, this](const FormulaOcrResult& res) {
+        if (!guard) return; // 窗口已关闭，安全退出
+        m_lastResult = res;
+
+        if (!res.success) {
+            m_latexEdit->setPlainText(QString("识别提示: %1").arg(res.errorMessage));
+            m_statusLabel->setText(QString("未提取到公式 | 通道: %1").arg(res.engineName));
+            m_renderedFormulaLabel->setText("选区内未提取到有效公式");
+
+            if (res.isAuthError && FormulaOcrManager::instance().isOfflinePluginReady()) {
+                auto reply = QMessageBox::question(
+                    this,
+                    "在线通道未授权",
+                    res.errorMessage + "\n\n检测到本地已安装离线公式识别插件 (RapidLaTeX)，是否立即切换至本地离线插件进行识别？",
+                    QMessageBox::Yes | QMessageBox::No,
+                    QMessageBox::Yes
+                );
+                if (reply == QMessageBox::Yes) {
+                    FormulaOcrManager::instance().setPreferredMode("Offline");
+                    refreshEngineComboState();
+                    startRecognition(m_sourceImage, m_dpr);
+                }
+            }
+            return;
+        }
+
+        m_latexEdit->setPlainText(res.latex);
+        m_statusLabel->setText(QString("耗时: %1ms | 通道: %2").arg(res.elapsedMs).arg(res.engineName));
+
+        // 若提取出的 LaTeX 为空或异常，不触发多余的网络微渲染
+        if (res.latex.trimmed().isEmpty()) {
+            m_renderedFormulaLabel->setText("未提取到公式内容");
+            return;
+        }
+
+        // 发起公式超高清 300 DPI 矢量微渲染预览 (彻底解决发虚与模糊)
+        FormulaOcrManager::instance().renderFormulaAsync(res.latex, [guard, this](bool success, const QByteArray& imgData, const QString& mimeType) {
+            Q_UNUSED(mimeType);
+            if (!guard) return; // 窗口已关闭，安全退出
+            if (!success || imgData.isEmpty()) {
+                m_renderedFormulaLabel->setText(m_latexEdit->toPlainText());
+                return;
+            }
+
+            QPixmap previewPix;
+            if (previewPix.loadFromData(imgData)) {
+                // CodeCogs 300 DPI 输出按 DPR 缩放换算，保证 Retina / 4K 高分屏下全真锐利
+                qreal screenDpr = devicePixelRatioF();
+                qreal targetDpr = (screenDpr >= 2.0) ? (300.0 / 96.0) : 2.5;
+                previewPix.setDevicePixelRatio(targetDpr);
+                m_renderedFormulaLabel->setPixmap(previewPix);
+            } else {
+                m_renderedFormulaLabel->setText(m_latexEdit->toPlainText());
+            }
+        });
+    });
+}

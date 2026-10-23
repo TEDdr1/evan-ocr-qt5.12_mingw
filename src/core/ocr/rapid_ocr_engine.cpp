@@ -1,0 +1,317 @@
+#include "rapid_ocr_engine.h"
+#include <QCoreApplication>
+#include <QDir>
+#include <QDirIterator>
+#include <QFile>
+#include <QFileInfo>
+#include <QProcess>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QDateTime>
+#include <QThreadPool>
+#include <QMetaObject>
+#include <QDebug>
+#include <algorithm>
+#include <cmath>
+#include "qt5_compat.h"
+
+RapidOcrEngine::RapidOcrEngine(QObject* parent)
+    : QObject(parent)
+{
+}
+
+QString RapidOcrEngine::findExecutablePath() const
+{
+    QString appDir = QCoreApplication::applicationDirPath();
+    QStringList candidates = {
+        appDir + "/plugins/ocr/RapidOCR-json.exe",
+        appDir + "/plugins/ocr/rapidocr.exe",
+        appDir + "/plugins/evan-plugin-rapidocr-engine/RapidOCR-json.exe",
+        appDir + "/plugins/evan-plugin-rapidocr-engine/rapidocr.exe",
+        appDir + "/plugins/ocr/evan-plugin-rapidocr-engine/RapidOCR-json.exe",
+        appDir + "/plugins/rapidocr/RapidOCR-json.exe",
+        appDir + "/plugins/rapidocr/rapidocr.exe",
+        appDir + "/rapidocr/RapidOCR-json.exe",
+        appDir + "/rapidocr/rapidocr.exe",
+        "plugins/ocr/RapidOCR-json.exe",
+        "plugins/ocr/rapidocr.exe",
+        "plugins/evan-plugin-rapidocr-engine/RapidOCR-json.exe",
+        "rapidocr/RapidOCR-json.exe",
+        "RapidOCR-json.exe"
+    };
+
+    for (const auto& path : candidates) {
+        if (QFile::exists(path)) {
+            return QDir::toNativeSeparators(QFileInfo(path).absoluteFilePath());
+        }
+    }
+
+    // 智能动态递归容错：遍历 plugins/ 及其任意层级子目录 (彻底兼容用户手动解压时带包名文件夹甚至多层嵌套)
+    QStringList searchRoots = { appDir + "/plugins", "plugins" };
+    for (const auto& root : searchRoots) {
+        if (QDir(root).exists()) {
+            QDirIterator it(root, QStringList() << "RapidOCR-json.exe" << "rapidocr.exe",
+                            QDir::Files, QDirIterator::Subdirectories);
+            if (it.hasNext()) {
+                return QDir::toNativeSeparators(QFileInfo(it.next()).absoluteFilePath());
+            }
+        }
+    }
+
+    return QString();
+}
+
+QString RapidOcrEngine::findModelsDir() const
+{
+    // 1. 若可执行文件已找到，优先检测该 exe 所在同级目录或父级目录下的 models
+    QString exePath = findExecutablePath();
+    if (!exePath.isEmpty()) {
+        QDir exeDir = QFileInfo(exePath).dir();
+        if (exeDir.exists("models")) {
+            return QDir::toNativeSeparators(exeDir.absoluteFilePath("models"));
+        }
+        if (exeDir.cdUp() && exeDir.exists("models")) {
+            return QDir::toNativeSeparators(exeDir.absoluteFilePath("models"));
+        }
+    }
+
+    QString appDir = QCoreApplication::applicationDirPath();
+    QStringList candidates = {
+        appDir + "/plugins/ocr/models",
+        appDir + "/plugins/evan-plugin-rapidocr-engine/models",
+        appDir + "/plugins/rapidocr/models",
+        appDir + "/rapidocr/models",
+        "plugins/ocr/models",
+        "plugins/evan-plugin-rapidocr-engine/models",
+        "rapidocr/models",
+        "models"
+    };
+
+    for (const auto& dir : candidates) {
+        if (QDir(dir).exists()) {
+            return QDir::toNativeSeparators(QFileInfo(dir).absoluteFilePath());
+        }
+    }
+
+    // 智能动态递归容错：遍历 plugins/ 下任意层级子目录中存在的 models/
+    QStringList searchRoots = { appDir + "/plugins", "plugins" };
+    for (const auto& root : searchRoots) {
+        if (QDir(root).exists()) {
+            QDirIterator it(root, QStringList() << "models",
+                            QDir::Dirs | QDir::NoDotAndDotDot, QDirIterator::Subdirectories);
+            if (it.hasNext()) {
+                return QDir::toNativeSeparators(QFileInfo(it.next()).absoluteFilePath());
+            }
+        }
+    }
+
+    return QString();
+}
+
+bool RapidOcrEngine::isAvailable() const
+{
+    QString exe = findExecutablePath();
+    return !exe.isEmpty();
+}
+
+QString RapidOcrEngine::componentPath() const
+{
+    QString exe = findExecutablePath();
+    if (!exe.isEmpty()) return exe;
+    return "未安装 (检测路径: rapidocr/RapidOCR-json.exe)";
+}
+
+OcrResult RapidOcrEngine::recognize(const QImage& image, qreal dpr)
+{
+    OcrResult result;
+    result.dpr = dpr;
+
+    if (image.isNull() || image.width() <= 0 || image.height() <= 0) {
+        result.success = false;
+        result.errorMessage = "待识别图像数据为空";
+        return result;
+    }
+
+    QString exePath = findExecutablePath();
+    if (exePath.isEmpty()) {
+        result.success = false;
+        result.errorMessage = "未检测到 RapidOCR 运行组件。\n请在程序目录 rapidocr/ 放置 RapidOCR-json.exe 及模型文件。";
+        return result;
+    }
+
+    // 将图像写入临时高速缓存文件
+    QString tempFile = QDir::tempPath() + QString("/evan_rapidocr_%1_%2.png")
+                       .arg(QCoreApplication::applicationPid())
+                       .arg(QDateTime::currentMSecsSinceEpoch());
+
+    if (!image.save(tempFile, "PNG")) {
+        result.success = false;
+        result.errorMessage = "临时图像写入失败";
+        return result;
+    }
+
+    // 组装命令行参数并调用 RapidOCR 进程
+    QProcess process;
+    process.setWorkingDirectory(QFileInfo(exePath).absolutePath());
+
+    QStringList args;
+    args << "--ensureAscii=0";
+    args << "--ensureLogger=0";
+    args << QString("--image_path=%1").arg(QDir::toNativeSeparators(tempFile));
+
+    // Qt 5.12 不支持 setProgram/setArguments 分离式启动，直接一次性传入程序与参数
+    process.start(exePath, args);
+
+    if (!process.waitForStarted(3000)) {
+        QFile::remove(tempFile);
+        result.success = false;
+        result.errorMessage = "启动 RapidOCR 推理进程超时失败";
+        return result;
+    }
+
+    if (!process.waitForFinished(15000)) {
+        process.kill();
+        QFile::remove(tempFile);
+        result.success = false;
+        result.errorMessage = "RapidOCR 识别处理超时";
+        return result;
+    }
+
+    QByteArray output = process.readAllStandardOutput();
+    QFile::remove(tempFile);
+
+    if (output.isEmpty()) {
+        QByteArray errOutput = process.readAllStandardError();
+        result.success = false;
+        result.errorMessage = errOutput.isEmpty() ? "RapidOCR 未返回识别数据" : QString::fromUtf8(errOutput);
+        return result;
+    }
+
+    // 截取纯净的 JSON 文本内容 (过滤掉进程启动输出的 Banner 与日志行)
+    int startIdx = output.indexOf('{');
+    int endIdx = output.lastIndexOf('}');
+    QByteArray jsonBytes;
+    if (startIdx >= 0 && endIdx >= startIdx) {
+        jsonBytes = output.mid(startIdx, endIdx - startIdx + 1);
+    } else {
+        jsonBytes = output;
+    }
+
+    // 解析 JSON 识别结果
+    QJsonParseError parseErr;
+    QJsonDocument doc = QJsonDocument::fromJson(jsonBytes, &parseErr);
+    if (doc.isNull() || !doc.isObject()) {
+        // 如果不是标准 json，尝试按纯文本行处理
+        QString rawStr = QString::fromUtf8(output).trimmed();
+        if (!rawStr.isEmpty()) {
+            result.success = true;
+            result.fullText = rawStr;
+            OcrLine line;
+            line.text = rawStr;
+            line.logicalBox = QRect(0, 0, static_cast<int>(image.width() / dpr), static_cast<int>(image.height() / dpr));
+            result.lines.append(line);
+            return result;
+        }
+
+        result.success = false;
+        result.errorMessage = QString("解析 RapidOCR 结果失败: %1").arg(parseErr.errorString());
+        return result;
+    }
+
+    QJsonObject root = doc.object();
+    int code = root.value("code").toInt(0);
+
+    // code 101 表示图中未发现可识别文字
+    if (code == 101) {
+        result.success = true;
+        result.fullText = "";
+        return result;
+    }
+
+    // 标准 RapidOCR-json: code 100 表示成功
+    if (code != 100 && root.contains("code")) {
+        result.success = false;
+        result.errorMessage = root.value("msg").toString("RapidOCR 推理异常");
+        return result;
+    }
+
+    QJsonArray dataArr = root.value("data").toArray();
+    result.success = true;
+    QString fullText;
+
+    for (const auto& val : dataArr) {
+        if (!val.isObject()) continue;
+        QJsonObject block = val.toObject();
+
+        QString text = block.value("text").toString().trimmed();
+        if (text.isEmpty()) continue;
+
+        double score = block.value("score").toDouble(1.0);
+
+        // 提取 4 个顶点坐标 [[x1, y1], [x2, y2], [x3, y3], [x4, y4]]
+        QJsonArray boxArr = block.value("box").toArray();
+        int minX = 999999, minY = 999999, maxX = -1, maxY = -1;
+
+        for (const auto& ptVal : boxArr) {
+            QJsonArray pt = ptVal.toArray();
+            if (pt.size() >= 2) {
+                int px = pt.at(0).toInt();
+                int py = pt.at(1).toInt();
+                minX = (std::min)(minX, px);
+                minY = (std::min)(minY, py);
+                maxX = (std::max)(maxX, px);
+                maxY = (std::max)(maxY, py);
+            }
+        }
+
+        QRect physBox;
+        if (minX <= maxX && minY <= maxY) {
+            physBox = QRect(minX, minY, maxX - minX, maxY - minY);
+        } else {
+            physBox = QRect(0, 0, image.width(), image.height());
+        }
+
+        OcrLine lineObj;
+        lineObj.text = text;
+        lineObj.confidence = static_cast<float>(score);
+        lineObj.boundingBox = physBox;
+        lineObj.logicalBox = QRect(
+            static_cast<int>(std::round(physBox.x() / dpr)),
+            static_cast<int>(std::round(physBox.y() / dpr)),
+            static_cast<int>(std::round(physBox.width() / dpr)),
+            static_cast<int>(std::round(physBox.height() / dpr))
+        );
+
+        // 模拟词级别包围盒
+        OcrWord wordObj;
+        wordObj.text = text;
+        wordObj.confidence = static_cast<float>(score);
+        wordObj.boundingBox = lineObj.boundingBox;
+        wordObj.logicalBox = lineObj.logicalBox;
+        lineObj.words.append(wordObj);
+
+        result.lines.append(lineObj);
+
+        if (!fullText.isEmpty()) {
+            fullText += "\n";
+        }
+        fullText += text;
+    }
+
+    result.fullText = fullText;
+    return result;
+}
+
+void RapidOcrEngine::recognizeAsync(const QImage& image, qreal dpr, std::function<void(const OcrResult&)> callback)
+{
+    QImage imgCopy = image.copy();
+    evan::runInThreadPool([this, imgCopy, dpr, callback]() {
+        OcrResult res = recognize(imgCopy, dpr);
+        QMetaObject::invokeMethod(this, [callback, res]() {
+            if (callback) {
+                callback(res);
+            }
+        });
+    });
+}

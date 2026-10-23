@@ -1,0 +1,135 @@
+#pragma once
+
+#include <QWidget>
+#include <QRect>
+#include <QPoint>
+#include <QLabel>
+#include "../../core/screen_capturer.h"
+#include "../../core/smart_snapper.h"
+#include "../../core/char_edit/char_segmentation.h"
+#include "../../core/capture/scroll_stitcher.h"
+#include "../toolbar/floating_toolbar.h"
+#include "../annotation/annotation_manager.h"
+#include <vector>
+
+class MagnifierWidget;
+class InPlaceTextEditor;
+class SingleCharEditor;
+
+enum class SnippingState {
+    Idle,           // 未激活/智能候选吸附中
+    Selecting,      // 正在拖拽框选中
+    Selected        // 选区已建立，可微调/标注
+};
+
+enum class HandleType {
+    None,
+    TopLeft, Top, TopRight,
+    Right, BottomRight, Bottom,
+    BottomLeft, Left,
+    Inside
+};
+
+class SnippingOverlay : public QWidget
+{
+    Q_OBJECT
+public:
+    static SnippingOverlay& instance();
+
+    // 启动截屏覆盖
+    void startSnipping();
+
+    // 一键全屏截图：直接捕捉整个虚拟桌面 (支持多显示器) 并复制到剪贴板
+    void startFullScreenCapture();
+
+    // 获取当前建立的选区 (基于全景画布的绝对坐标)
+    QRect selectedRect() const { return m_selectionRect; }
+    ScreenSnapshot currentSnapshot() const { return m_snapshot; }
+    bool hasValidSelection() const { return !m_selectionRect.isNull() && m_selectionRect.isValid(); }
+
+    // 核心操作触发接口 (供按键、工具栏与外部全局热键调用)
+    void triggerPinAction();
+    void triggerConfirmAction();
+    void triggerSaveAction();
+    void triggerOcrAction();
+    void triggerFormulaOcrAction();
+    void triggerCancelAction();
+    void triggerUndoAction();
+    void selectTool(ToolAction tool);
+
+signals:
+    void snippingCancelled();
+    void snippingFinished(const QPixmap& croppedPixmap, const QRect& region);
+    void pinRequested(const QPixmap& croppedPixmap, const QRect& screenPos);
+
+protected:
+    void paintEvent(QPaintEvent* event) override;
+    void mousePressEvent(QMouseEvent* event) override;
+    void mouseMoveEvent(QMouseEvent* event) override;
+    void mouseReleaseEvent(QMouseEvent* event) override;
+    void keyPressEvent(QKeyEvent* event) override;
+
+private:
+    explicit SnippingOverlay(QWidget* parent = nullptr);
+    ~SnippingOverlay() override = default;
+
+    HandleType getHandleAt(const QPoint& pt) const;
+    void updateCursorForHandle(HandleType handle);
+    void resizeSelection(const QPoint& pt);
+    QPixmap renderSelectedArea();
+
+    // 以物理像素精确定位并铺满指定物理区域 (规避混合缩放多屏下的逻辑坐标错位)
+    void applyPhysicalGeometry(const QRect& physicalRect);
+
+    // 当前选区对应的全局逻辑矩形 (供贴图 / 长截图边框等顶层窗口定位)
+    QRect globalSelectionRect() const;
+
+    // 当前选区对应的物理像素矩形 (供跨屏精确采样)
+    QRect physicalSelectionRect() const;
+
+    ScreenSnapshot m_snapshot;
+    SnippingState m_state = SnippingState::Idle;
+    bool m_initializing = false;   // 遮罩初始化探测中 (忽略用户输入)
+    QPoint m_dragStartPos;
+    QRect m_selectionRect;
+    MagnifierWidget* m_magnifier = nullptr;
+    FloatingToolbar* m_toolbar = nullptr;
+
+    // 8 控制手柄与拖拽位移状态
+    HandleType m_activeHandle = HandleType::None;
+    QPoint m_moveOffset;
+    static constexpr int HANDLE_SIZE = 8;
+
+    // 矢量标注管理器与当前激活工具
+    AnnotationManager m_annotationMgr;
+    ToolAction m_currentTool = ToolAction::Cancel;
+    QPoint m_annotStartPos;
+    QPoint m_currentAnnotMousePos;
+    bool m_isDrawingAnnotation = false;
+    std::shared_ptr<PencilAnnotation> m_currentPencil;
+    InPlaceTextEditor* m_textEditor = nullptr;
+
+    // 当前标注颜色 / 线条粗细 / 文字大小 (由工具栏信号同步)
+    QColor m_annotColor = QColor(235, 30, 30);
+    int m_annotStrokeWidth = 4;
+    int m_annotFontSize = 17;
+
+    // 智能选框分析器与候选层级
+    SmartSnapper m_snapper;
+    std::vector<QRect> m_smartCandidates;
+    size_t m_candidateIndex = 0;
+    bool m_enableSmartSnapping = true;
+
+    // 单字符就地编辑/P图系统
+    SingleCharEditor* m_singleCharEditor = nullptr;
+    QList<SingleCharUnit> m_charUnits;
+    int m_hoveredCharIndex = -1;
+    bool m_ocrRunningForSelection = false;
+    void detectCharsInSelection();
+
+    // 辅助滚动长截图会话与 GIF 录屏
+    class ScrollCaptureSession* m_scrollSession = nullptr;
+    class GifRecordSession* m_gifSession = nullptr;
+    void startScrollCapture();
+    void triggerGifRecord();
+};
